@@ -245,6 +245,8 @@ def draft_email(account: str, to: str, subject: str, body: str,
         return f"Draft creation failed: {type(e).__name__}: {e}"
 
     audit.log("draft_email", account, draft_id=result["draft_id"], to=to, subject=subject)
+    audit.log_draft_body(action="draft_email", account=account, draft_id=result["draft_id"],
+                         to=to, subject=subject, body=body)
     return (
         f"Draft created (NOT sent).\n"
         f"draft_id: {result['draft_id']}\n"
@@ -258,7 +260,8 @@ def draft_email(account: str, to: str, subject: str, body: str,
 @mcp.tool()
 def draft_reply(account: str, message_id: str, body: str,
                 include_original: bool = False,
-                attachments: str = "") -> str:
+                attachments: str = "",
+                cc: str = "", bcc: str = "") -> str:
     """
     Create a reply draft to an existing message. Preserves threading headers.
     Does NOT send. Use send_draft to confirm.
@@ -269,6 +272,8 @@ def draft_reply(account: str, message_id: str, body: str,
         body: Your reply text.
         include_original: If True, quote the original message below your reply.
         attachments: Comma-separated absolute file paths.
+        cc: Optional CC recipients (comma-separated).
+        bcc: Optional BCC recipients (comma-separated).
     """
     creds = _require_creds(account)
     try:
@@ -286,7 +291,22 @@ def draft_reply(account: str, message_id: str, body: str,
 
     reply_body = body
     if include_original:
-        quoted = "\n".join("> " + line for line in original["body"].splitlines())
+        # Quote only the newest message's own content: the plain-text body
+        # already carries the full nested history (">"-prefixed) and old
+        # signatures with raw tracking URLs — re-quoting it builds a ">>>"
+        # ladder in the outgoing mail.
+        fresh_lines = []
+        for line in original["body"].splitlines():
+            if line.lstrip().startswith(">"):
+                break
+            fresh_lines.append(line)
+        while fresh_lines and (
+            not fresh_lines[-1].strip()
+            or fresh_lines[-1].startswith("On ")
+            or fresh_lines[-1].strip() == "wrote:"
+        ):
+            fresh_lines.pop()
+        quoted = "\n".join("> " + line for line in fresh_lines)
         reply_body = f"{body}\n\nOn {original['date']}, {original['from']} wrote:\n{quoted}"
 
     try:
@@ -298,6 +318,7 @@ def draft_reply(account: str, message_id: str, body: str,
         result = gmail_client.create_draft(
             creds, from_email=account,
             to=reply_to, subject=subject, body=reply_body,
+            cc=cc, bcc=bcc,
             in_reply_to=in_reply_to, references=in_reply_to,
             thread_id=original["thread_id"],
             attachments=attach_paths,
@@ -306,11 +327,18 @@ def draft_reply(account: str, message_id: str, body: str,
         return f"Reply draft failed: {type(e).__name__}: {e}"
 
     audit.log("draft_reply", account, draft_id=result["draft_id"],
-              reply_to_message=message_id, subject=subject)
+              reply_to_message=message_id, subject=subject,
+              cc=cc, bcc=bcc)
+    audit.log_draft_body(action="draft_reply", account=account, draft_id=result["draft_id"],
+                         reply_to_message=message_id, thread_id=original["thread_id"],
+                         subject=subject, body=body)
+    cc_line = f"Cc: {cc}\n" if cc else ""
+    bcc_line = f"Bcc: {bcc}\n" if bcc else ""
     return (
         f"Reply draft created (NOT sent).\n"
         f"draft_id: {result['draft_id']}\n"
         f"To: {reply_to}\n"
+        f"{cc_line}{bcc_line}"
         f"Subject: {subject}\n\n"
         f"Preview of reply body:\n{reply_body[:500]}{'...' if len(reply_body) > 500 else ''}\n\n"
         f"To send: send_draft('{account}', '{result['draft_id']}')"
@@ -453,12 +481,32 @@ def remove_label(account: str, message_id: str, label_id: str) -> str:
 # ---------- Audit ----------
 
 @mcp.tool()
-def view_audit_log(n: int = 25) -> str:
-    """Show the last n actions this server took on your Gmail accounts."""
-    entries = audit.tail(n)
+def view_audit_log(n: int = 100, since: str = "", until: str = "",
+                   account: str = "", action: str = "") -> str:
+    """Actions this server took on your Gmail accounts, newest last.
+
+    n: how many entries to show (default 100).
+    since / until: ISO date or timestamp, e.g. since="2026-09-23" until="2026-09-24"
+        for a single day. Filters run BEFORE the cut, so an old day is reachable
+        without asking for thousands of lines.
+    account / action: case-insensitive substrings, e.g. account="app@laoshi.io",
+        action="draft".
+
+    The log covers ONLY this server. Anything writing to the same mailbox with its
+    own credentials - the support automation in GitHub Actions, a person in the
+    Gmail interface - leaves no trace here, so an empty result means "not us",
+    not "nobody".
+    """
+    entries = audit.tail(n, since=since, until=until, account=account, action=action)
     if not entries:
-        return "No audit entries yet."
-    lines = [f"Last {len(entries)} actions:"]
+        first, last, total = audit.span()
+        if not total:
+            return "No audit entries yet."
+        return (f"Nothing matched. The log holds {total} entries, {first} .. {last} — "
+                f"so this is an answer about the log, not an empty log.")
+    first, last, total = audit.span()
+    head = f"{len(entries)} of {total} entries (log spans {first[:10]} .. {last[:10]})"
+    lines = [head + ":"]
     for e in entries:
         base = f"[{e.get('ts')}] {e.get('action')} on {e.get('account')}"
         extras = {k: v for k, v in e.items() if k not in ("ts", "action", "account")}
